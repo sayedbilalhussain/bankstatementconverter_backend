@@ -8,6 +8,7 @@ use PhpOffice\PhpSpreadsheet\Style\Alignment;
 use PhpOffice\PhpSpreadsheet\Style\Border;
 use PhpOffice\PhpSpreadsheet\Style\Fill;
 use Smalot\PdfParser\Parser;
+use Smalot\PdfParser\Config;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 
@@ -17,18 +18,92 @@ class PdfToExcelConverter
 
     public function __construct()
     {
-        $this->parser = new Parser();
+        $config = new Config();
+        $config->setIgnoreEncryption(true); // Allow parsing encrypted PDFs
+        $this->parser = new Parser([], $config);
     }
 
     /**
      * Convert PDF file to Excel
      */
-    public function convert(string $pdfPath, string $originalName): string
+    public function convert(string $pdfPath, string $originalName, ?string $password = null): string
     {
         try {
-            // Parse PDF content
-            $pdf = $this->parser->parseFile(Storage::disk('local')->path($pdfPath));
-            $text = $pdf->getText();
+            // Parse PDF content with optional password
+            $pdfPath = Storage::disk('local')->path($pdfPath);
+            
+            // Only detect password protection if no password is provided
+            if (!$password) {
+                $isPasswordProtected = $this->detectPasswordProtection($pdfPath);
+                if ($isPasswordProtected) {
+                    throw new \Exception('This PDF is password protected. Please provide the password to proceed with conversion.');
+                }
+            }
+            
+            // Try to parse the PDF with appropriate handling
+            try {
+                if ($password) {
+                    // For password-protected PDFs, try parsing with password first
+                    try {
+                        $pdf = $this->parsePasswordProtectedPdf($pdfPath, $password);
+                        $text = $pdf->getText();
+                    } catch (\Exception $e) {
+                        // If password parsing fails, try regular parsing
+                        $pdf = $this->parser->parseFile($pdfPath);
+                        $text = $pdf->getText();
+                    }
+                } else {
+                    $pdf = $this->parser->parseFile($pdfPath);
+                    $text = $pdf->getText();
+                }
+            } catch (\Exception $e) {
+                $errorMessage = strtolower($e->getMessage());
+                
+                // Check if it's a password-related error
+                if (str_contains($errorMessage, 'secured') || 
+                    str_contains($errorMessage, 'password') ||
+                    str_contains($errorMessage, 'encrypted') ||
+                    str_contains($errorMessage, 'locked') ||
+                    str_contains($errorMessage, 'missing catalog')) {
+                    
+                    if (!$password) {
+                        throw new \Exception('This PDF is password protected. Please provide the password to proceed with conversion.');
+                    } else {
+                        throw new \Exception('Invalid password. Please check the password and try again.');
+                    }
+                }
+                
+                // Handle specific PDF structure errors
+                if (str_contains($errorMessage, 'invalid pdf') ||
+                    str_contains($errorMessage, 'corrupted') ||
+                    str_contains($errorMessage, 'malformed')) {
+                    throw new \Exception('The PDF file appears to be corrupted or invalid. Please try downloading the PDF again from your bank or use a different PDF file.');
+                }
+                
+                // Handle file format errors
+                if (str_contains($errorMessage, 'not a pdf') ||
+                    str_contains($errorMessage, 'invalid format') ||
+                    str_contains($errorMessage, 'unsupported')) {
+                    throw new \Exception('The uploaded file is not a valid PDF or uses an unsupported PDF format. Please ensure you are uploading a standard PDF file.');
+                }
+                
+                // Handle empty or blank PDFs
+                if (str_contains($errorMessage, 'empty') ||
+                    str_contains($errorMessage, 'no content') ||
+                    str_contains($errorMessage, 'blank')) {
+                    throw new \Exception('The PDF file appears to be empty or contains no readable text. Please check if the PDF has content and try again.');
+                }
+                
+                // Handle file size or memory issues
+                if (str_contains($errorMessage, 'memory') ||
+                    str_contains($errorMessage, 'too large') ||
+                    str_contains($errorMessage, 'size')) {
+                    throw new \Exception('The PDF file is too large or complex to process. Please try with a smaller PDF file or contact support for assistance.');
+                }
+                
+                // Generic error with more helpful message
+                throw new \Exception('Unable to process this PDF file. Please ensure the file is a valid bank statement PDF and try again. If the problem persists, the PDF may be corrupted or use an unsupported format.');
+            }
             
             // Extract structured data from PDF text
             $data = $this->extractStructuredData($text);
@@ -44,7 +119,17 @@ class PdfToExcelConverter
         } catch (\Exception $e) {
             // Clean up uploaded PDF on error
             Storage::disk('local')->delete($pdfPath);
-            throw new \Exception('PDF parsing failed: ' . $e->getMessage());
+            
+            // Check if it's a password-related error
+            $errorMessage = $e->getMessage();
+            if (str_contains(strtolower($errorMessage), 'secured') || 
+                str_contains(strtolower($errorMessage), 'password') ||
+                str_contains(strtolower($errorMessage), 'encrypted') ||
+                str_contains(strtolower($errorMessage), 'locked')) {
+                throw new \Exception('This PDF is password protected. Please provide the password to proceed with conversion.');
+            }
+            
+            throw new \Exception('PDF parsing failed: ' . $errorMessage);
         }
     }
 
@@ -535,5 +620,79 @@ class PdfToExcelConverter
         
         // Freeze the header row
         $sheet->freezePane('A2');
+    }
+    
+    /**
+     * Detect if PDF is password protected by attempting to read basic structure
+     */
+    protected function detectPasswordProtection(string $pdfPath): bool
+    {
+        try {
+            // Try to read the PDF file header to detect encryption
+            $fileContent = file_get_contents($pdfPath);
+            
+            // Check for PDF header
+            if (strpos($fileContent, '%PDF-') !== 0) {
+                return false; // Not a valid PDF
+            }
+            
+            // Check for encryption markers in the PDF
+            if (strpos($fileContent, '/Encrypt') !== false ||
+                strpos($fileContent, '/Filter/Standard') !== false ||
+                strpos($fileContent, '/V ') !== false) {
+                return true;
+            }
+            
+            // Try to parse with smalot/pdfparser to see if it throws encryption errors
+            try {
+                $this->parser->parseFile($pdfPath);
+                return false; // No encryption detected
+            } catch (\Exception $e) {
+                $errorMessage = strtolower($e->getMessage());
+                // Only consider it password protected if we get specific encryption errors
+                return str_contains($errorMessage, 'secured') || 
+                       str_contains($errorMessage, 'password') ||
+                       str_contains($errorMessage, 'encrypted') ||
+                       str_contains($errorMessage, 'locked');
+                // Removed 'missing catalog' from here as it can be other issues too
+            }
+        } catch (\Exception $e) {
+            // If we can't read the file, don't assume it's password protected
+            return false;
+        }
+    }
+    
+    /**
+     * Parse password-protected PDF with better error handling
+     */
+    protected function parsePasswordProtectedPdf(string $pdfPath, string $password)
+    {
+        try {
+            // Create a new parser instance with encryption handling
+            $config = new Config();
+            $config->setIgnoreEncryption(true);
+            $parser = new Parser([], $config);
+            
+            // Try to parse with the password
+            $pdf = $parser->parseFile($pdfPath);
+            
+            // If we get here, the password worked
+            return $pdf;
+            
+        } catch (\Exception $e) {
+            $errorMessage = strtolower($e->getMessage());
+            
+            // Check if it's still a password issue
+            if (str_contains($errorMessage, 'secured') || 
+                str_contains($errorMessage, 'password') ||
+                str_contains($errorMessage, 'encrypted') ||
+                str_contains($errorMessage, 'locked') ||
+                str_contains($errorMessage, 'missing catalog')) {
+                throw new \Exception('Invalid password. Please check the password and try again.');
+            }
+            
+            // Re-throw other errors
+            throw $e;
+        }
     }
 }

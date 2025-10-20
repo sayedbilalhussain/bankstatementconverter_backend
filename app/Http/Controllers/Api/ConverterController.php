@@ -26,6 +26,7 @@ class ConverterController extends Controller
     {
         $validator = Validator::make($request->all(), [
             'pdf_file' => 'required|file|mimes:pdf|max:20480', // 20MB max for bank statements
+            'password' => 'nullable|string|max:255', // Optional password for encrypted PDFs
         ]);
 
         if ($validator->fails()) {
@@ -38,14 +39,15 @@ class ConverterController extends Controller
 
         try {
             $pdfFile = $request->file('pdf_file');
+            $password = $request->input('password');
             $originalName = $pdfFile->getClientOriginalName();
             $fileName = Str::random(40) . '.pdf';
             
             // Store the uploaded PDF
             $pdfPath = $pdfFile->storeAs('uploads', $fileName, 'local');
             
-            // Convert PDF to Excel
-            $excelPath = $this->converter->convert($pdfPath, $originalName);
+            // Convert PDF to Excel with optional password
+            $excelPath = $this->converter->convert($pdfPath, $originalName, $password);
             
             // Generate download URL
             $downloadUrl = url('/api/converter/download/' . basename($excelPath));
@@ -63,6 +65,17 @@ class ConverterController extends Controller
             // Clean up uploaded file if conversion fails
             if (isset($pdfPath)) {
                 Storage::disk('local')->delete($pdfPath);
+            }
+            
+            // Check if it's a password-related error
+            if (str_contains(strtolower($e->getMessage()), 'password') || 
+                str_contains(strtolower($e->getMessage()), 'encrypted') ||
+                str_contains(strtolower($e->getMessage()), 'locked')) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'This PDF is password protected. Please provide the password.',
+                    'requires_password' => true
+                ], 400);
             }
             
             return response()->json([
