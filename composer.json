@@ -12,8 +12,8 @@
         "laravel/tinker": "^2.8",
         "phpoffice/phpspreadsheet": "^1.29",
         "setasign/fpdi": "^2.6",
-        "smalot/pdfparser": "^2.6",
-        "tecnickcom/tcpdf": "^6.10"
+        "setasign/fpdi-protection": "^2.1",
+        "smalot/pdfparser": "^2.6"
     },
     "require-dev": {
         "fakerphp/faker": "^1.9.1",

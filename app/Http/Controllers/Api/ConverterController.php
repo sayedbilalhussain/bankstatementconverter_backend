@@ -67,16 +67,23 @@ class ConverterController extends Controller
                 Storage::disk('local')->delete($pdfPath);
             }
             
-            // Check if it's a password-related error
-            if (str_contains(strtolower($e->getMessage()), 'password') || 
-                str_contains(strtolower($e->getMessage()), 'encrypted') ||
-                str_contains(strtolower($e->getMessage()), 'locked')) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'This PDF is password protected. Please provide the password.',
-                    'requires_password' => true
-                ], 400);
-            }
+                // Check if it's a password-related error
+                if (str_contains(strtolower($e->getMessage()), 'password') || 
+                    str_contains(strtolower($e->getMessage()), 'encrypted') ||
+                    str_contains(strtolower($e->getMessage()), 'locked')) {
+                    
+                    if (!$password) {
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'This PDF is password protected. Please provide the password.'
+                        ], 400);
+                    } else {
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Sorry, this PDF uses encryption that cannot be processed by our current system. Please remove the password from your PDF file and try again.'
+                        ], 400);
+                    }
+                }
             
             return response()->json([
                 'success' => false,
