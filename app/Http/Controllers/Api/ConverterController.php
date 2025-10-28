@@ -49,16 +49,20 @@ class ConverterController extends Controller
             // Convert PDF to Excel with optional password
             $excelPath = $this->converter->convert($pdfPath, $originalName, $password);
             
+            // Generate Excel filename for download
+            $excelFileName = basename($excelPath);
+            
             // Generate download URL
-            $downloadUrl = url('/api/converter/download/' . basename($excelPath));
+            $downloadUrl = url('/api/converter/download/' . $excelFileName);
             
             return response()->json([
                 'success' => true,
                 'message' => 'PDF converted to Excel successfully',
                 'download_url' => $downloadUrl,
                 'original_filename' => $originalName,
-                'excel_filename' => basename($excelPath),
-                'file_type' => $this->detectFileType($originalName)
+                'excel_filename' => $excelFileName,
+                'file_type' => $this->detectFileType($originalName),
+                'file_path' => $excelPath
             ]);
 
         } catch (\Exception $e) {
@@ -123,13 +127,37 @@ class ConverterController extends Controller
      */
     public function download(string $file): \Symfony\Component\HttpFoundation\StreamedResponse
     {
-        $filePath = 'converted/' . $file;
+        // Try to find the file in date-based folders
+        $filePath = $this->findFileInDateFolders($file);
         
-        if (!Storage::disk('local')->exists($filePath)) {
+        if (!$filePath || !Storage::disk('local')->exists($filePath)) {
             abort(404, 'File not found');
         }
 
         return Storage::disk('local')->download($filePath, $file);
+    }
+    
+    /**
+     * Find file in date-based folders
+     */
+    protected function findFileInDateFolders(string $fileName): ?string
+    {
+        try {
+            $basePath = 'converted';
+            $dateFolders = Storage::disk('local')->directories($basePath);
+            
+            // Search in date folders (most recent first)
+            foreach (array_reverse($dateFolders) as $folder) {
+                $filePath = $folder . '/' . $fileName;
+                if (Storage::disk('local')->exists($filePath)) {
+                    return $filePath;
+                }
+            }
+        } catch (\Exception $e) {
+            \Log::warning("Failed to find file: " . $e->getMessage());
+        }
+        
+        return null;
     }
 
     /**

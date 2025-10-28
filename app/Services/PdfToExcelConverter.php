@@ -514,15 +514,67 @@ class PdfToExcelConverter
         // Apply formatting
         $this->applyFormatting($sheet, $row - 1);
         
-        // Generate filename
-        $fileName = Str::random(40) . '.xlsx';
-        $filePath = 'converted/' . $fileName;
+        // Generate proper filename based on original PDF name
+        $fileName = $this->generateExcelFileName($originalName);
+        
+        // Create date-based folder structure
+        $currentDate = date('Y-m-d');
+        $dateFolder = 'converted/' . $currentDate;
+        $filePath = $dateFolder . '/' . $fileName;
+        
+        // If the date folder doesn't exist, clean up old date folders first
+        if (!Storage::disk('local')->exists($dateFolder)) {
+            $this->removeOldDateFolders('converted', $currentDate);
+            Storage::disk('local')->makeDirectory($dateFolder);
+        }
         
         // Save Excel file
         $writer = new Xlsx($spreadsheet);
         $writer->save(Storage::disk('local')->path($filePath));
         
         return $filePath;
+    }
+    
+    /**
+     * Generate Excel filename based on original PDF name
+     */
+    protected function generateExcelFileName(string $originalName): string
+    {
+        // Remove .pdf extension and add timestamp
+        $nameWithoutExtension = pathinfo($originalName, PATHINFO_FILENAME);
+        
+        // Sanitize filename to remove special characters
+        $safeName = preg_replace('/[^A-Za-z0-9_-]/', '_', $nameWithoutExtension);
+        
+        // Add timestamp for uniqueness
+        $timestamp = time();
+        
+        return $safeName . '_' . $timestamp . '.xlsx';
+    }
+    
+    /**
+     * Remove old date folders when creating a new one
+     */
+    protected function removeOldDateFolders(string $basePath, string $currentDate): void
+    {
+        try {
+            $allFolders = Storage::disk('local')->directories($basePath);
+            
+            foreach ($allFolders as $folder) {
+                $folderName = basename($folder);
+                
+                // Check if folder name is a date (YYYY-MM-DD format)
+                if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $folderName)) {
+                    // Delete folder if it's a different date (old date folder)
+                    if ($folderName !== $currentDate) {
+                        Storage::disk('local')->deleteDirectory($folder);
+                        \Log::info("Removed old date folder: {$folder}");
+                    }
+                }
+            }
+        } catch (\Exception $e) {
+            \Log::warning("Failed to remove old date folders: " . $e->getMessage());
+        }
     }
 
     /**
