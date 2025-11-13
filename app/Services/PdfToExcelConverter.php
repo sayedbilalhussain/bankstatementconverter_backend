@@ -249,7 +249,8 @@ class PdfToExcelConverter
         $inTransactionSection = false;
         $headerFound = false;
         $consecutiveNonTransactionLines = 0;
-        $maxConsecutiveNonTransaction = 20; // Allow up to 20 non-transaction lines before resetting (for page breaks)
+        $maxConsecutiveNonTransaction = 20;
+        $currentTransaction = null; // For handling multi-line transactions
         
         foreach ($lines as $lineIndex => $line) {
             $line = trim($line);
@@ -257,6 +258,11 @@ class PdfToExcelConverter
             // Skip empty lines
             if (empty($line)) {
                 $consecutiveNonTransactionLines++;
+                // If we have a current transaction being built, save it
+                if ($currentTransaction && !empty($currentTransaction['date'])) {
+                    $transactionLines[] = $currentTransaction;
+                    $currentTransaction = null;
+                }
                 continue;
             }
             
@@ -265,11 +271,16 @@ class PdfToExcelConverter
                 $inTransactionSection = true;
                 $headerFound = true;
                 $consecutiveNonTransactionLines = 0;
-                // Don't skip - continue to process transactions
+                // Save any current transaction before starting new section
+                if ($currentTransaction && !empty($currentTransaction['date'])) {
+                    $transactionLines[] = $currentTransaction;
+                    $currentTransaction = null;
+                }
                 continue;
             }
             
-            // Check if this is a transaction line
+            // Check if this line starts a new transaction (has a date)
+            $hasDate = $this->hasDate($line);
             $isTransaction = $this->isTransactionLine($line);
             
             // If we haven't found a header yet, but this looks like a transaction, start processing
@@ -279,50 +290,65 @@ class PdfToExcelConverter
                 $consecutiveNonTransactionLines = 0;
             }
             
-            // If we're in transaction section and found a transaction, process it
-            if ($inTransactionSection && $isTransaction) {
-                $transaction = $this->parseTransactionLine($line);
-                if ($transaction && !empty($transaction['date'])) {
-                    $transactionLines[] = $transaction;
-                    $consecutiveNonTransactionLines = 0; // Reset counter
-                }
-                continue;
-            }
-            
-            // If we're in transaction section but this isn't a transaction
+            // If we're in transaction section
             if ($inTransactionSection) {
-                // Check if this is a definitive end marker
-                if ($this->isDefinitiveEndMarker($line)) {
-                    $consecutiveNonTransactionLines++;
-                    // Only reset after seeing multiple consecutive non-transaction lines
-                    if ($consecutiveNonTransactionLines >= $maxConsecutiveNonTransaction) {
-                        $inTransactionSection = false;
-                        $headerFound = false;
-                        $consecutiveNonTransactionLines = 0;
+                // If this line has a date, it's a new transaction
+                if ($hasDate) {
+                    // Save previous transaction if exists
+                    if ($currentTransaction && !empty($currentTransaction['date'])) {
+                        $transactionLines[] = $currentTransaction;
                     }
-                } else {
-                    // Not a definitive end, just increment counter
-                    $consecutiveNonTransactionLines++;
-                    // If too many non-transaction lines, reset (might be between pages)
-                    if ($consecutiveNonTransactionLines >= $maxConsecutiveNonTransaction) {
-                        $inTransactionSection = false;
-                        $headerFound = false;
+                    // Start new transaction
+                    $currentTransaction = $this->parseBankAlfalahTransaction($line);
+                    $consecutiveNonTransactionLines = 0;
+                } 
+                // If no date but we have a current transaction, this might be a continuation line
+                elseif ($currentTransaction && !empty($currentTransaction['date'])) {
+                    // Check if this looks like a continuation (has text but no date)
+                    if ($this->isContinuationLine($line)) {
+                        // Append to description
+                        $currentTransaction['description'] .= ' ' . $this->cleanContinuationLine($line);
                         $consecutiveNonTransactionLines = 0;
+                    } else {
+                        // Doesn't look like continuation, save current and reset
+                        $transactionLines[] = $currentTransaction;
+                        $currentTransaction = null;
+                        $consecutiveNonTransactionLines++;
+                    }
+                } 
+                // Not a transaction and not a continuation
+                else {
+                    // Check if this is a definitive end marker
+                    if ($this->isDefinitiveEndMarker($line)) {
+                        $consecutiveNonTransactionLines++;
+                        if ($consecutiveNonTransactionLines >= $maxConsecutiveNonTransaction) {
+                            $inTransactionSection = false;
+                            $headerFound = false;
+                            $consecutiveNonTransactionLines = 0;
+                        }
+                    } else {
+                        $consecutiveNonTransactionLines++;
+                        if ($consecutiveNonTransactionLines >= $maxConsecutiveNonTransaction) {
+                            $inTransactionSection = false;
+                            $headerFound = false;
+                            $consecutiveNonTransactionLines = 0;
+                        }
                     }
                 }
             } else {
                 // Not in transaction section - check if this could be a transaction anyway
-                // (allows recovery after reset, especially on new pages)
-                if ($isTransaction) {
+                if ($isTransaction && $hasDate) {
                     $inTransactionSection = true;
                     $headerFound = true;
                     $consecutiveNonTransactionLines = 0;
-                    $transaction = $this->parseTransactionLine($line);
-                    if ($transaction && !empty($transaction['date'])) {
-                        $transactionLines[] = $transaction;
-                    }
+                    $currentTransaction = $this->parseBankAlfalahTransaction($line);
                 }
             }
+        }
+        
+        // Save last transaction if exists
+        if ($currentTransaction && !empty($currentTransaction['date'])) {
+            $transactionLines[] = $currentTransaction;
         }
         
         \Log::info('Bank statement extraction completed', [
@@ -344,7 +370,7 @@ class PdfToExcelConverter
         foreach ($transactionLines as $transaction) {
             $data[] = [
                 $transaction['date'] ?? '',
-                $transaction['description'] ?? '',
+                trim($transaction['description'] ?? ''),
                 $transaction['debit'] ?? '',
                 $transaction['credit'] ?? '',
                 $transaction['balance'] ?? ''
@@ -352,6 +378,160 @@ class PdfToExcelConverter
         }
         
         return $data;
+    }
+    
+    /**
+     * Check if line has a date
+     */
+    protected function hasDate(string $line): bool
+    {
+        $datePatterns = [
+            '/\d{1,2}\/\d{1,2}\/\d{2,4}/',
+            '/\d{4}-\d{2}-\d{2}/',
+            '/\d{1,2}-\d{1,2}-\d{2,4}/',
+            '/\d{2}-\d{2}-\d{4}/',
+            '/[A-Za-z]{3}\s+\d{1,2},?\s+\d{4}/',
+            '/\d{1,2}\s+[A-Za-z]{3}\s+\d{4}/'
+        ];
+        
+        foreach ($datePatterns as $pattern) {
+            if (preg_match($pattern, $line)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Check if line is a continuation of previous transaction
+     */
+    protected function isContinuationLine(string $line): bool
+    {
+        // Continuation lines typically:
+        // - Don't have dates
+        // - Have text (not just numbers)
+        // - Don't start with amounts
+        // - May have reference numbers or codes
+        
+        if ($this->hasDate($line)) {
+            return false; // Has date, so it's a new transaction
+        }
+        
+        // If it's just numbers/amounts, probably not a continuation
+        if (preg_match('/^[\d,\.\s\-]+$/', $line)) {
+            return false;
+        }
+        
+        // If it starts with a large amount, probably not continuation
+        if (preg_match('/^[\d,]+\.\d{2}/', $line)) {
+            return false;
+        }
+        
+        // Has text, likely a continuation
+        return preg_match('/[A-Za-z]/', $line);
+    }
+    
+    /**
+     * Clean continuation line (remove amounts that might be at the end)
+     */
+    protected function cleanContinuationLine(string $line): string
+    {
+        // Remove trailing amounts that might be parsed incorrectly
+        $line = preg_replace('/[\d,]+\.\d{2}\s*$/', '', $line);
+        return trim($line);
+    }
+    
+    /**
+     * Parse Bank Alfalah transaction format: Date | Description | Cheq/Inst# | Debit | Credit | Balance
+     */
+    protected function parseBankAlfalahTransaction(string $line): array
+    {
+        // Extract date (should be at the start)
+        $date = $this->extractDate($line);
+        
+        // Remove date from line for further processing
+        $remaining = preg_replace('/^\d{1,2}-\d{1,2}-\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4}/', '', $line, 1);
+        $remaining = trim($remaining);
+        
+        // Extract all numeric amounts (Debit, Credit, Balance)
+        $amounts = $this->extractAllAmounts($remaining);
+        
+        // Bank Alfalah format: Date | Description | Cheq/Inst# | Debit | Credit | Balance
+        // Typically: 1 date, 0-1 debit, 0-1 credit, 1 balance
+        $debit = '';
+        $credit = '';
+        $balance = '';
+        
+        // The last amount is usually the balance
+        if (!empty($amounts)) {
+            $balance = end($amounts);
+            array_pop($amounts);
+            
+            // Remaining amounts: could be debit or credit
+            if (count($amounts) > 0) {
+                // Check if line mentions debit/credit
+                $lineLower = strtolower($line);
+                if (stripos($lineLower, 'debit') !== false || preg_match('/-\d+/', $line)) {
+                    $debit = $amounts[0];
+                } else {
+                    $credit = $amounts[0];
+                }
+            }
+        }
+        
+        // Extract description: everything except date and amounts
+        $description = $remaining;
+        foreach ($amounts as $amount) {
+            $description = str_replace($amount, '', $description);
+        }
+        if (!empty($balance)) {
+            $description = str_replace($balance, '', $description);
+        }
+        
+        // Clean up description
+        $description = preg_replace('/\s{2,}/', ' ', $description);
+        $description = trim($description);
+        
+        // Remove common prefixes/suffixes
+        $description = preg_replace('/^(debit|credit|balance)\s*/i', '', $description);
+        
+        return [
+            'date' => $date,
+            'description' => $description,
+            'debit' => $debit,
+            'credit' => $credit,
+            'balance' => $balance
+        ];
+    }
+    
+    /**
+     * Extract all amounts from line (including those without currency symbols)
+     */
+    protected function extractAllAmounts(string $line): array
+    {
+        $amounts = [];
+        
+        // Pattern 1: Numbers with commas and decimals (e.g., 1,234.56, 789,196.42)
+        if (preg_match_all('/[\d,]+\.\d{2}/', $line, $matches)) {
+            foreach ($matches[0] as $match) {
+                $amounts[] = $match;
+            }
+        }
+        
+        // Pattern 2: Numbers with commas but no decimals (e.g., 20,000)
+        if (preg_match_all('/[\d,]+(?<!\.\d{2})(?=\s|$)/', $line, $matches)) {
+            foreach ($matches[0] as $match) {
+                // Only add if it's a substantial number (not a year or small number)
+                $cleanNum = str_replace(',', '', $match);
+                if (is_numeric($cleanNum) && $cleanNum >= 100) {
+                    $amounts[] = $match;
+                }
+            }
+        }
+        
+        // Remove duplicates and return
+        return array_unique($amounts);
     }
 
     /**
