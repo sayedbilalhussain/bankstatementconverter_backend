@@ -242,7 +242,7 @@ class PdfToExcelConverter
     protected function extractBankStatementData(array $lines): array
     {
         $data = [];
-        $headers = ['Date', 'Description', 'Debit', 'Credit', 'Balance'];
+        $headers = ['Date', 'Description', 'Cheq/Inst#', 'Debit', 'Credit', 'Balance'];
         $data[] = $headers;
         
         $transactionLines = [];
@@ -306,8 +306,11 @@ class PdfToExcelConverter
                 elseif ($currentTransaction && !empty($currentTransaction['date'])) {
                     // Check if this looks like a continuation (has text but no date)
                     if ($this->isContinuationLine($line)) {
-                        // Append to description
-                        $currentTransaction['description'] .= ' ' . $this->cleanContinuationLine($line);
+                        // Append to description - preserve all text
+                        $continuationText = $this->cleanContinuationLine($line);
+                        if (!empty($continuationText)) {
+                            $currentTransaction['description'] .= ' ' . $continuationText;
+                        }
                         $consecutiveNonTransactionLines = 0;
                     } else {
                         // Doesn't look like continuation, save current and reset
@@ -371,9 +374,10 @@ class PdfToExcelConverter
             $data[] = [
                 $transaction['date'] ?? '',
                 trim($transaction['description'] ?? ''),
-                $transaction['debit'] ?? '',
-                $transaction['credit'] ?? '',
-                $transaction['balance'] ?? ''
+                $transaction['cheq_inst'] ?? '',
+                $this->removeCurrencySymbol($transaction['debit'] ?? ''),
+                $this->removeCurrencySymbol($transaction['credit'] ?? ''),
+                $this->removeCurrencySymbol($transaction['balance'] ?? '')
             ];
         }
         
@@ -433,12 +437,13 @@ class PdfToExcelConverter
     }
     
     /**
-     * Clean continuation line (remove amounts that might be at the end)
+     * Clean continuation line (remove amounts that might be at the end, but preserve all text)
      */
     protected function cleanContinuationLine(string $line): string
     {
-        // Remove trailing amounts that might be parsed incorrectly
-        $line = preg_replace('/[\d,]+\.\d{2}\s*$/', '', $line);
+        // Don't remove trailing amounts if they're part of the description
+        // Just clean up extra whitespace
+        $line = preg_replace('/\s{2,}/', ' ', $line);
         return trim($line);
     }
     
@@ -462,6 +467,7 @@ class PdfToExcelConverter
         $debit = '';
         $credit = '';
         $balance = '';
+        $cheqInst = '';
         
         // The last amount is usually the balance
         if (!empty($amounts)) {
@@ -470,9 +476,16 @@ class PdfToExcelConverter
             
             // Remaining amounts: could be debit or credit
             if (count($amounts) > 0) {
-                // Check if line mentions debit/credit
+                // Check if line mentions debit/credit or has negative indicator
                 $lineLower = strtolower($line);
-                if (stripos($lineLower, 'debit') !== false || preg_match('/-\d+/', $line)) {
+                // Check position - debit usually comes before credit in the line
+                $debitPos = stripos($line, $amounts[0]);
+                $creditPos = stripos($line, $amounts[0]);
+                
+                // Simple heuristic: if amount appears early in line, might be debit; later might be credit
+                // Or check for negative signs
+                if (preg_match('/-\s*' . preg_quote($amounts[0], '/') . '/', $line) || 
+                    stripos($lineLower, 'debit') !== false) {
                     $debit = $amounts[0];
                 } else {
                     $credit = $amounts[0];
@@ -480,29 +493,96 @@ class PdfToExcelConverter
             }
         }
         
-        // Extract description: everything except date and amounts
-        $description = $remaining;
-        foreach ($amounts as $amount) {
-            $description = str_replace($amount, '', $description);
-        }
-        if (!empty($balance)) {
-            $description = str_replace($balance, '', $description);
+        // Extract Cheq/Inst# - typically alphanumeric codes like VO24062700118770, PK13ALFH..., FundTransfer, etc.
+        // These usually appear between description and amounts
+        $cheqPatterns = [
+            '/\b(VO\d{12,})\b/i',                    // VO24062700118770
+            '/\b(PK\d{2}[A-Z]{4}\d{16,})\b/i',       // PK13ALFH00630010...
+            '/\b(AC-[A-Z0-9]+)\b/i',                  // AC-PL55566
+            '/\b(SMSCHG\s+\d{6})\b/i',               // SMSCHG 202407
+            '/\b(FT\s+[A-Z-]+)\b/i',                 // FT IBALFA-RAAST
+            '/\b(FundTransfer)\b/i',
+            '/\b(1-LINK)\b/i',
+            '/\b(ATM)\b/i',
+            '/\b(POS)\b/i',
+            '/\b(RAAST)\b/i',
+            '/\b(IBFT)\b/i',
+            '/\b(Swift\s+Inward)\b/i',
+            '/\b(Inter\s+Bank)\b/i',
+            '/\b([A-Z]{2,}\d{8,})\b/',               // Generic: 2+ letters followed by 8+ digits
+        ];
+        
+        foreach ($cheqPatterns as $pattern) {
+            if (preg_match($pattern, $remaining, $cheqMatches)) {
+                $cheqInst = trim($cheqMatches[1]);
+                break;
+            }
         }
         
-        // Clean up description
+        // Extract description: everything except date, amounts, and cheq/inst#
+        // Use a more careful approach to preserve all text
+        $description = $remaining;
+        
+        // Remove amounts from the end first (they're usually at the end)
+        if (!empty($balance)) {
+            // Remove balance from end
+            $description = preg_replace('/' . preg_quote($balance, '/') . '\s*$/', '', $description);
+        }
+        
+        // Remove other amounts
+        foreach ($amounts as $amount) {
+            // Remove amount, but be careful not to remove parts of descriptions
+            $description = preg_replace('/\s*' . preg_quote($amount, '/') . '\s*/', ' ', $description);
+        }
+        
+        // Remove cheq/inst# if found (but preserve surrounding text)
+        if (!empty($cheqInst)) {
+            $description = preg_replace('/\b' . preg_quote($cheqInst, '/') . '\b/i', '', $description);
+        }
+        
+        // Clean up description - preserve all text, just normalize whitespace
         $description = preg_replace('/\s{2,}/', ' ', $description);
         $description = trim($description);
         
-        // Remove common prefixes/suffixes
+        // Remove common prefixes/suffixes but keep the actual description
         $description = preg_replace('/^(debit|credit|balance)\s*/i', '', $description);
+        
+        // Ensure we don't lose any text - if description is too short after cleaning, 
+        // it might mean we removed too much, so be more conservative
+        if (strlen($description) < 3 && strlen($remaining) > 20) {
+            // Something went wrong, use a more conservative approach
+            $description = $remaining;
+            // Only remove the balance amount from the very end
+            if (!empty($balance)) {
+                $description = preg_replace('/' . preg_quote($balance, '/') . '\s*$/', '', $description);
+            }
+            $description = trim($description);
+        }
         
         return [
             'date' => $date,
             'description' => $description,
+            'cheq_inst' => $cheqInst,
             'debit' => $debit,
             'credit' => $credit,
             'balance' => $balance
         ];
+    }
+    
+    /**
+     * Remove currency symbols from amounts
+     */
+    protected function removeCurrencySymbol(string $amount): string
+    {
+        if (empty($amount)) {
+            return '';
+        }
+        
+        // Remove $, €, £, PKR, AED, etc.
+        $amount = preg_replace('/^[\$€£PKRAED\s]+/i', '', $amount);
+        $amount = preg_replace('/[\$€£PKRAED\s]+$/i', '', $amount);
+        
+        return trim($amount);
     }
     
     /**
