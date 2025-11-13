@@ -449,52 +449,226 @@ class PdfToExcelConverter
     
     /**
      * Parse Bank Alfalah transaction format: Date | Description | Cheq/Inst# | Debit | Credit | Balance
+     * Enterprise-grade parsing with column position analysis
      */
     protected function parseBankAlfalahTransaction(string $line): array
     {
         // Extract date (should be at the start)
         $date = $this->extractDate($line);
         
+        if (empty($date)) {
+            // No date found, return empty transaction
+            return [
+                'date' => '',
+                'description' => '',
+                'cheq_inst' => '',
+                'debit' => '',
+                'credit' => '',
+                'balance' => ''
+            ];
+        }
+        
         // Remove date from line for further processing
         $remaining = preg_replace('/^\d{1,2}-\d{1,2}-\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4}/', '', $line, 1);
         $remaining = trim($remaining);
         
-        // Extract all numeric amounts (Debit, Credit, Balance)
-        $amounts = $this->extractAllAmounts($remaining);
+        // ENTERPRISE APPROACH: Split line into potential columns using multiple spaces or tabs
+        // This respects the table structure better
+        $columns = $this->splitIntoStructuredColumns($remaining);
         
-        // Bank Alfalah format: Date | Description | Cheq/Inst# | Debit | Credit | Balance
-        // Typically: 1 date, 0-1 debit, 0-1 credit, 1 balance
-        $debit = '';
-        $credit = '';
-        $balance = '';
-        $cheqInst = '';
+        // Analyze column structure
+        $analysis = $this->analyzeColumnStructure($columns, $remaining);
         
-        // The last amount is usually the balance
-        if (!empty($amounts)) {
-            $balance = end($amounts);
-            array_pop($amounts);
+        return [
+            'date' => $date,
+            'description' => $analysis['description'],
+            'cheq_inst' => $analysis['cheq_inst'],
+            'debit' => $analysis['debit'],
+            'credit' => $analysis['credit'],
+            'balance' => $analysis['balance']
+        ];
+    }
+    
+    /**
+     * Split line into structured columns based on spacing patterns
+     */
+    protected function splitIntoStructuredColumns(string $line): array
+    {
+        // Method 1: Split by 3+ spaces (likely column separator)
+        if (preg_match('/\s{3,}/', $line)) {
+            $columns = preg_split('/\s{3,}/', $line);
+            $columns = array_map('trim', $columns);
+            $columns = array_filter($columns, function($col) {
+                return !empty($col);
+            });
+            if (count($columns) >= 3) {
+                return array_values($columns);
+            }
+        }
+        
+        // Method 2: Split by tabs
+        if (strpos($line, "\t") !== false) {
+            $columns = explode("\t", $line);
+            $columns = array_map('trim', $columns);
+            $columns = array_filter($columns, function($col) {
+                return !empty($col);
+            });
+            if (count($columns) >= 2) {
+                return array_values($columns);
+            }
+        }
+        
+        // Method 3: Smart split - look for pattern: text, code, amount, amount, amount
+        // This handles cases where columns aren't clearly separated
+        return [$line]; // Return as single column if can't split
+    }
+    
+    /**
+     * Analyze column structure to assign data correctly
+     */
+    protected function analyzeColumnStructure(array $columns, string $fullLine): array
+    {
+        $result = [
+            'description' => '',
+            'cheq_inst' => '',
+            'debit' => '',
+            'credit' => '',
+            'balance' => ''
+        ];
+        
+        // Extract all amounts with their positions
+        $amounts = $this->extractAmountsWithPositions($fullLine);
+        
+        // Extract Cheq/Inst# first (before amounts)
+        $cheqInst = $this->extractCheqInstCode($fullLine);
+        $result['cheq_inst'] = $cheqInst;
+        
+        // Determine which amounts are debit, credit, balance
+        // Rule: Last amount is ALWAYS balance
+        // If there are 2 amounts: first is debit/credit, second is balance
+        // If there are 3 amounts: first is debit, second is credit, third is balance
+        // If there's 1 amount: it's balance (opening balance case)
+        
+        if (count($amounts) >= 3) {
+            // Three amounts: Debit, Credit, Balance
+            $result['debit'] = $amounts[0]['value'];
+            $result['credit'] = $amounts[1]['value'];
+            $result['balance'] = $amounts[2]['value'];
+        } elseif (count($amounts) == 2) {
+            // Two amounts: Need to determine which is debit/credit
+            // Check positions and context
+            $firstAmount = $amounts[0]['value'];
+            $secondAmount = $amounts[1]['value'];
+            $result['balance'] = $secondAmount; // Last is always balance
             
-            // Remaining amounts: could be debit or credit
-            if (count($amounts) > 0) {
-                // Check if line mentions debit/credit or has negative indicator
-                $lineLower = strtolower($line);
-                // Check position - debit usually comes before credit in the line
-                $debitPos = stripos($line, $amounts[0]);
-                $creditPos = stripos($line, $amounts[0]);
-                
-                // Simple heuristic: if amount appears early in line, might be debit; later might be credit
-                // Or check for negative signs
-                if (preg_match('/-\s*' . preg_quote($amounts[0], '/') . '/', $line) || 
-                    stripos($lineLower, 'debit') !== false) {
-                    $debit = $amounts[0];
-                } else {
-                    $credit = $amounts[0];
+            // Check if first amount position suggests debit or credit
+            // If line has "debit" keyword or negative, it's debit
+            $lineLower = strtolower($fullLine);
+            if (stripos($lineLower, 'debit') !== false || 
+                preg_match('/-\s*' . preg_quote($firstAmount, '/') . '/', $fullLine)) {
+                $result['debit'] = $firstAmount;
+            } else {
+                $result['credit'] = $firstAmount;
+            }
+        } elseif (count($amounts) == 1) {
+            // One amount: Could be credit or balance
+            // If it's at the very end, it's likely balance
+            // Otherwise might be credit
+            $amount = $amounts[0]['value'];
+            $amountPos = $amounts[0]['position'];
+            $lineLength = strlen($fullLine);
+            
+            // If amount is in last 30% of line, it's balance
+            if ($amountPos > ($lineLength * 0.7)) {
+                $result['balance'] = $amount;
+            } else {
+                $result['credit'] = $amount;
+            }
+        }
+        
+        // Extract description: Remove date, amounts, and cheq/inst# from full line
+        $description = $fullLine;
+        
+        // Remove amounts (from right to left to preserve order)
+        $amountsReversed = array_reverse($amounts);
+        foreach ($amountsReversed as $amountInfo) {
+            $description = $this->removeAmountFromString($description, $amountInfo['value'], $amountInfo['position']);
+        }
+        
+        // Remove cheq/inst# if found
+        if (!empty($cheqInst)) {
+            $description = preg_replace('/\b' . preg_quote($cheqInst, '/') . '\b/i', '', $description);
+        }
+        
+        // Clean up description
+        $description = preg_replace('/\s{2,}/', ' ', $description);
+        $description = trim($description);
+        
+        // Remove common prefixes
+        $description = preg_replace('/^(debit|credit|balance)\s*/i', '', $description);
+        
+        $result['description'] = $description;
+        
+        return $result;
+    }
+    
+    /**
+     * Extract amounts with their positions in the line
+     */
+    protected function extractAmountsWithPositions(string $line): array
+    {
+        $amounts = [];
+        
+        // Pattern 1: Numbers with commas and decimals (e.g., 1,234.56, 789,196.42)
+        // Also match amounts that might have $ prefix
+        if (preg_match_all('/\$?[\d,]+\.\d{2}/', $line, $matches, PREG_OFFSET_CAPTURE)) {
+            foreach ($matches[0] as $match) {
+                $value = $this->removeCurrencySymbol($match[0]); // Remove $ immediately
+                $amounts[] = [
+                    'value' => $value,
+                    'position' => $match[1]
+                ];
+            }
+        }
+        
+        // Pattern 2: Numbers with commas but no decimals (e.g., 20,000) - only if substantial
+        if (preg_match_all('/\$?[\d,]+(?<!\.\d{2})(?=\s|$)/', $line, $matches, PREG_OFFSET_CAPTURE)) {
+            foreach ($matches[0] as $match) {
+                $cleanNum = str_replace(',', '', $match[0]);
+                $cleanNum = $this->removeCurrencySymbol($cleanNum);
+                if (is_numeric($cleanNum) && $cleanNum >= 100) {
+                    // Check if this isn't already captured as decimal amount
+                    $isDuplicate = false;
+                    foreach ($amounts as $existing) {
+                        if (str_replace(',', '', $existing['value']) === $cleanNum) {
+                            $isDuplicate = true;
+                            break;
+                        }
+                    }
+                    if (!$isDuplicate) {
+                        $value = $this->removeCurrencySymbol($match[0]); // Remove $ immediately
+                        $amounts[] = [
+                            'value' => $value,
+                            'position' => $match[1]
+                        ];
+                    }
                 }
             }
         }
         
-        // Extract Cheq/Inst# - typically alphanumeric codes like VO24062700118770, PK13ALFH..., FundTransfer, etc.
-        // These usually appear between description and amounts
+        // Sort by position (left to right)
+        usort($amounts, function($a, $b) {
+            return $a['position'] - $b['position'];
+        });
+        
+        return $amounts;
+    }
+    
+    /**
+     * Extract Cheq/Inst# code from line
+     */
+    protected function extractCheqInstCode(string $line): string
+    {
         $cheqPatterns = [
             '/\b(VO\d{12,})\b/i',                    // VO24062700118770
             '/\b(PK\d{2}[A-Z]{4}\d{16,})\b/i',       // PK13ALFH00630010...
@@ -513,64 +687,26 @@ class PdfToExcelConverter
         ];
         
         foreach ($cheqPatterns as $pattern) {
-            if (preg_match($pattern, $remaining, $cheqMatches)) {
-                $cheqInst = trim($cheqMatches[1]);
-                break;
+            if (preg_match($pattern, $line, $matches)) {
+                return trim($matches[1]);
             }
         }
         
-        // Extract description: everything except date, amounts, and cheq/inst#
-        // Use a more careful approach to preserve all text
-        $description = $remaining;
-        
-        // Remove amounts from the end first (they're usually at the end)
-        if (!empty($balance)) {
-            // Remove balance from end
-            $description = preg_replace('/' . preg_quote($balance, '/') . '\s*$/', '', $description);
-        }
-        
-        // Remove other amounts
-        foreach ($amounts as $amount) {
-            // Remove amount, but be careful not to remove parts of descriptions
-            $description = preg_replace('/\s*' . preg_quote($amount, '/') . '\s*/', ' ', $description);
-        }
-        
-        // Remove cheq/inst# if found (but preserve surrounding text)
-        if (!empty($cheqInst)) {
-            $description = preg_replace('/\b' . preg_quote($cheqInst, '/') . '\b/i', '', $description);
-        }
-        
-        // Clean up description - preserve all text, just normalize whitespace
-        $description = preg_replace('/\s{2,}/', ' ', $description);
-        $description = trim($description);
-        
-        // Remove common prefixes/suffixes but keep the actual description
-        $description = preg_replace('/^(debit|credit|balance)\s*/i', '', $description);
-        
-        // Ensure we don't lose any text - if description is too short after cleaning, 
-        // it might mean we removed too much, so be more conservative
-        if (strlen($description) < 3 && strlen($remaining) > 20) {
-            // Something went wrong, use a more conservative approach
-            $description = $remaining;
-            // Only remove the balance amount from the very end
-            if (!empty($balance)) {
-                $description = preg_replace('/' . preg_quote($balance, '/') . '\s*$/', '', $description);
-            }
-            $description = trim($description);
-        }
-        
-        return [
-            'date' => $date,
-            'description' => $description,
-            'cheq_inst' => $cheqInst,
-            'debit' => $debit,
-            'credit' => $credit,
-            'balance' => $balance
-        ];
+        return '';
     }
     
     /**
-     * Remove currency symbols from amounts
+     * Remove amount from string at specific position
+     */
+    protected function removeAmountFromString(string $text, string $amount, int $position): string
+    {
+        // Remove the amount, being careful not to remove parts of other text
+        $text = preg_replace('/\s*' . preg_quote($amount, '/') . '\s*/', ' ', $text);
+        return trim($text);
+    }
+    
+    /**
+     * Remove currency symbols from amounts - ENTERPRISE: Remove ALL currency symbols anywhere
      */
     protected function removeCurrencySymbol(string $amount): string
     {
@@ -578,11 +714,20 @@ class PdfToExcelConverter
             return '';
         }
         
-        // Remove $, €, £, PKR, AED, etc.
-        $amount = preg_replace('/^[\$€£PKRAED\s]+/i', '', $amount);
-        $amount = preg_replace('/[\$€£PKRAED\s]+$/i', '', $amount);
+        // Convert to string if not already
+        $amount = (string)$amount;
         
-        return trim($amount);
+        // Remove ALL currency symbols: $, €, £, PKR, AED, etc. (anywhere in the string)
+        $amount = str_replace(['$', '€', '£', 'PKR', 'AED', 'USD', 'EUR', 'GBP'], '', $amount);
+        
+        // Also remove with case-insensitive matching
+        $amount = preg_replace('/[\$€£]/', '', $amount);
+        $amount = preg_replace('/\b(PKR|AED|USD|EUR|GBP)\s*/i', '', $amount);
+        
+        // Remove leading/trailing whitespace
+        $amount = trim($amount);
+        
+        return $amount;
     }
     
     /**
@@ -925,11 +1070,30 @@ class PdfToExcelConverter
         
         // Add data to sheet
         $row = 1;
-        foreach ($data as $rowData) {
+        $amountColumnIndices = []; // Track which columns are amount columns
+        
+        foreach ($data as $rowIndex => $rowData) {
             $col = 'A';
+            $colIndex = 0;
+            
             foreach ($rowData as $cellData) {
-                $sheet->setCellValue($col . $row, $cellData);
+                // On first row, identify amount columns (Debit, Credit, Balance)
+                if ($row === 1) {
+                    $headerLower = strtolower(trim((string)$cellData));
+                    if (in_array($headerLower, ['debit', 'credit', 'balance'])) {
+                        $amountColumnIndices[] = $colIndex;
+                    }
+                }
+                
+                // Clean currency symbols from amounts before writing
+                $cleanedData = $cellData;
+                if ($row > 1 && in_array($colIndex, $amountColumnIndices)) {
+                    $cleanedData = $this->removeCurrencySymbol((string)$cellData);
+                }
+                
+                $sheet->setCellValue($col . $row, $cleanedData);
                 $col++;
+                $colIndex++;
             }
             $row++;
         }
@@ -1086,7 +1250,8 @@ class PdfToExcelConverter
             
             if (in_array($headerValue, ['debit', 'credit', 'balance']) && $maxRow > 1) {
                 $currencyRange = $col . '2:' . $col . $maxRow;
-                $sheet->getStyle($currencyRange)->getNumberFormat()->setFormatCode('$#,##0.00');
+                // Format as number with 2 decimals, NO currency symbol
+                $sheet->getStyle($currencyRange)->getNumberFormat()->setFormatCode('#,##0.00');
                 
                 // Apply conditional formatting for debits (red) and credits (green)
                 if ($headerValue === 'debit') {
