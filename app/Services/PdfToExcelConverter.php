@@ -42,8 +42,47 @@ class PdfToExcelConverter
                 // First try with smalot/pdfparser for regular PDFs
                 try {
                     $pdf = $this->parser->parseFile($pdfPath);
-            $text = $pdf->getText();
-                    \Log::info('PDF parsed successfully with smalot/pdfparser', ['textLength' => strlen($text)]);
+                    
+                    // Extract text from ALL pages explicitly
+                    $text = '';
+                    $pages = $pdf->getPages();
+                    $pageCount = count($pages);
+                    
+                    \Log::info('PDF parsed successfully with smalot/pdfparser', [
+                        'pageCount' => $pageCount,
+                        'textLength' => strlen($text)
+                    ]);
+                    
+                    // Extract text from each page
+                    foreach ($pages as $pageIndex => $page) {
+                        try {
+                            $pageText = $page->getText();
+                            if (!empty(trim($pageText))) {
+                                $text .= $pageText . "\n";
+                                \Log::info("Extracted text from page " . ($pageIndex + 1), [
+                                    'pageNumber' => $pageIndex + 1,
+                                    'textLength' => strlen($pageText)
+                                ]);
+                            }
+                        } catch (\Exception $e) {
+                            \Log::warning("Failed to extract text from page " . ($pageIndex + 1), [
+                                'error' => $e->getMessage()
+                            ]);
+                            // Continue with next page
+                            continue;
+                        }
+                    }
+                    
+                    // Fallback: If page-by-page extraction didn't work, try getText() on the whole document
+                    if (empty(trim($text))) {
+                        $text = $pdf->getText();
+                        \Log::info('Used getText() fallback for entire document', ['textLength' => strlen($text)]);
+                    }
+                    
+                    \Log::info('PDF parsing completed', [
+                        'totalPages' => $pageCount,
+                        'totalTextLength' => strlen($text)
+                    ]);
                 } catch (\Exception $e) {
                     $errorMessage = strtolower($e->getMessage());
                     
@@ -154,6 +193,7 @@ class PdfToExcelConverter
      */
     protected function extractStructuredData(string $text): array
     {
+        // Split text into lines, preserving page boundaries
         $lines = array_filter(explode("\n", $text), function($line) {
             return trim($line) !== '';
         });
@@ -162,6 +202,7 @@ class PdfToExcelConverter
         $isBankStatement = $this->detectBankStatement($text);
         
         if ($isBankStatement) {
+            // Use bank statement extraction method that handles multi-page statements
             $data = $this->extractBankStatementData($lines);
         } else {
             $data = $this->extractGeneralTabularData($lines);
@@ -206,34 +247,90 @@ class PdfToExcelConverter
         
         $transactionLines = [];
         $inTransactionSection = false;
+        $headerFound = false;
+        $consecutiveNonTransactionLines = 0;
+        $maxConsecutiveNonTransaction = 20; // Allow up to 20 non-transaction lines before resetting (for page breaks)
         
-        foreach ($lines as $line) {
+        foreach ($lines as $lineIndex => $line) {
             $line = trim($line);
             
             // Skip empty lines
             if (empty($line)) {
+                $consecutiveNonTransactionLines++;
                 continue;
             }
             
-            // Detect start of transaction section
+            // Detect start of transaction section (can happen multiple times across pages)
             if ($this->isTransactionHeader($line)) {
                 $inTransactionSection = true;
+                $headerFound = true;
+                $consecutiveNonTransactionLines = 0;
+                // Don't skip - continue to process transactions
                 continue;
             }
             
-            // Skip headers and summary lines
-            if (!$inTransactionSection && !$this->isTransactionLine($line)) {
-                continue;
+            // Check if this is a transaction line
+            $isTransaction = $this->isTransactionLine($line);
+            
+            // If we haven't found a header yet, but this looks like a transaction, start processing
+            if (!$headerFound && $isTransaction) {
+                $inTransactionSection = true;
+                $headerFound = true;
+                $consecutiveNonTransactionLines = 0;
             }
             
-            // Extract transaction data
-            if ($inTransactionSection && $this->isTransactionLine($line)) {
+            // If we're in transaction section and found a transaction, process it
+            if ($inTransactionSection && $isTransaction) {
                 $transaction = $this->parseTransactionLine($line);
-                if ($transaction) {
+                if ($transaction && !empty($transaction['date'])) {
                     $transactionLines[] = $transaction;
+                    $consecutiveNonTransactionLines = 0; // Reset counter
+                }
+                continue;
+            }
+            
+            // If we're in transaction section but this isn't a transaction
+            if ($inTransactionSection) {
+                // Check if this is a definitive end marker
+                if ($this->isDefinitiveEndMarker($line)) {
+                    $consecutiveNonTransactionLines++;
+                    // Only reset after seeing multiple consecutive non-transaction lines
+                    if ($consecutiveNonTransactionLines >= $maxConsecutiveNonTransaction) {
+                        $inTransactionSection = false;
+                        $headerFound = false;
+                        $consecutiveNonTransactionLines = 0;
+                    }
+                } else {
+                    // Not a definitive end, just increment counter
+                    $consecutiveNonTransactionLines++;
+                    // If too many non-transaction lines, reset (might be between pages)
+                    if ($consecutiveNonTransactionLines >= $maxConsecutiveNonTransaction) {
+                        $inTransactionSection = false;
+                        $headerFound = false;
+                        $consecutiveNonTransactionLines = 0;
+                    }
+                }
+            } else {
+                // Not in transaction section - check if this could be a transaction anyway
+                // (allows recovery after reset, especially on new pages)
+                if ($isTransaction) {
+                    $inTransactionSection = true;
+                    $headerFound = true;
+                    $consecutiveNonTransactionLines = 0;
+                    $transaction = $this->parseTransactionLine($line);
+                    if ($transaction && !empty($transaction['date'])) {
+                        $transactionLines[] = $transaction;
+                    }
                 }
             }
         }
+        
+        \Log::info('Bank statement extraction completed', [
+            'totalLines' => count($lines),
+            'transactionsFound' => count($transactionLines),
+            'firstTransactionDate' => !empty($transactionLines) ? ($transactionLines[0]['date'] ?? 'N/A') : 'N/A',
+            'lastTransactionDate' => !empty($transactionLines) ? (end($transactionLines)['date'] ?? 'N/A') : 'N/A'
+        ]);
         
         // Sort transactions by date (if dates are available)
         usort($transactionLines, function($a, $b) {
@@ -286,6 +383,41 @@ class PdfToExcelConverter
     }
 
     /**
+     * Check if line indicates end of transaction section
+     */
+    protected function isTransactionSectionEnd(string $line): bool
+    {
+        return $this->isDefinitiveEndMarker($line);
+    }
+    
+    /**
+     * Check if line is a definitive end marker (not just a page break)
+     */
+    protected function isDefinitiveEndMarker(string $line): bool
+    {
+        $lineLower = strtolower($line);
+        $endMarkers = [
+            'closing balance',
+            'end of statement',
+            'statement period',
+            'account summary',
+            'total.*balance',
+            'final.*balance'
+        ];
+        
+        // Don't treat "Page X of Y" as definitive end - it's just a page marker
+        // Don't treat "continued on next page" as end - it means more coming
+        
+        foreach ($endMarkers as $marker) {
+            if (preg_match('/' . $marker . '/i', $lineLower)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
      * Check if line is a transaction header
      */
     protected function isTransactionHeader(string $line): bool
@@ -311,12 +443,30 @@ class PdfToExcelConverter
      */
     protected function isTransactionLine(string $line): bool
     {
-        // Look for date patterns
+        // Skip if it's clearly a header
+        if ($this->isTransactionHeader($line)) {
+            return false;
+        }
+        
+        // Skip obvious metadata lines
+        $lineLower = strtolower($line);
+        $metadataKeywords = ['opening balance', 'closing balance', 'page', 'statement of account', 'bank alfalah'];
+        foreach ($metadataKeywords as $keyword) {
+            if (stripos($lineLower, $keyword) !== false && !preg_match('/\d{1,2}-\d{1,2}-\d{2,4}/', $line)) {
+                // If it contains metadata keyword but no date, it's likely metadata
+                return false;
+            }
+        }
+        
+        // Look for date patterns (more flexible)
         $datePatterns = [
-            '/\d{1,2}\/\d{1,2}\/\d{2,4}/',
-            '/\d{4}-\d{2}-\d{2}/',
-            '/\d{1,2}-\d{1,2}-\d{2,4}/',
-            '/[A-Za-z]{3}\s+\d{1,2},?\s+\d{4}/'
+            '/\d{1,2}\/\d{1,2}\/\d{2,4}/',           // 03/07/2024
+            '/\d{4}-\d{2}-\d{2}/',                    // 2024-07-03
+            '/\d{1,2}-\d{1,2}-\d{2,4}/',             // 03-07-2024 (Bank Alfalah format)
+            '/\d{2}-\d{2}-\d{4}/',                   // 03-07-2024 (strict)
+            '/[A-Za-z]{3}\s+\d{1,2},?\s+\d{4}/',     // Jan 3, 2024
+            '/\d{1,2}\s+[A-Za-z]{3}\s+\d{4}/',       // 3 Jan 2024
+            '/\d{8}/'                                 // 20240703 (YYYYMMDD)
         ];
 
         $hasDate = false;
@@ -327,11 +477,16 @@ class PdfToExcelConverter
             }
         }
 
-        // Look for currency amounts
+        // Look for currency amounts (more flexible patterns)
         $currencyPatterns = [
-            '/\$[\d,]+\.?\d*/',
-            '/[\d,]+\.\d{2}/',
-            '/[\d,]+\.\d{2}\s*[+-]?/'
+            '/\$[\d,]+\.?\d*/',                       // $1,234.56
+            '/[\d,]+\.\d{2}/',                        // 1,234.56
+            '/[\d,]+\.\d{1,2}/',                      // 1,234.5 or 1,234.56
+            '/[\d,]+\.\d{2}\s*[+-]?/',                // 1,234.56 with sign
+            '/\d+[,\.]\d+/',                          // Any number with comma or dot
+            '/PKR\s*[\d,]+\.?\d*/i',                  // PKR 1,234.56
+            '/AED\s*[\d,]+\.?\d*/i',                  // AED 1,234.56
+            '/[\d,]{4,}/'                             // Large numbers (4+ digits with commas)
         ];
 
         $hasCurrency = false;
@@ -339,6 +494,14 @@ class PdfToExcelConverter
             if (preg_match($pattern, $line)) {
                 $hasCurrency = true;
                 break;
+            }
+        }
+
+        // If we have a date, it's likely a transaction (even without explicit currency if there are numbers)
+        if ($hasDate) {
+            // Check if line has numbers that could be amounts
+            if ($hasCurrency || preg_match('/\d{3,}/', $line)) {
+                return true;
             }
         }
 
@@ -880,11 +1043,30 @@ class PdfToExcelConverter
                     
                     $parser = new Parser([], $config);
                     $pdf = $parser->parseFile($pdfPath);
-                    $text = $pdf->getText();
+                    
+                    // Extract text from ALL pages explicitly
+                    $text = '';
+                    $pages = $pdf->getPages();
+                    foreach ($pages as $pageIndex => $page) {
+                        try {
+                            $pageText = $page->getText();
+                            if (!empty(trim($pageText))) {
+                                $text .= $pageText . "\n";
+                            }
+                        } catch (\Exception $e) {
+                            continue; // Continue with next page
+                        }
+                    }
+                    
+                    // Fallback to getText() if page-by-page didn't work
+                    if (empty(trim($text))) {
+                        $text = $pdf->getText();
+                    }
                     
                     if (!empty(trim($text))) {
                         \Log::info('Aggressive smalot parsing succeeded', [
                             'config' => $configOptions, 
+                            'pageCount' => count($pages),
                             'textLength' => strlen($text),
                             'configIndex' => $index + 1
                         ]);
@@ -1088,10 +1270,32 @@ class PdfToExcelConverter
                     
                     $parser = new Parser([], $config);
                     $pdf = $parser->parseFile($pdfPath);
-                    $text = $pdf->getText();
+                    
+                    // Extract text from ALL pages explicitly
+                    $text = '';
+                    $pages = $pdf->getPages();
+                    foreach ($pages as $pageIndex => $page) {
+                        try {
+                            $pageText = $page->getText();
+                            if (!empty(trim($pageText))) {
+                                $text .= $pageText . "\n";
+                            }
+                        } catch (\Exception $e) {
+                            continue; // Continue with next page
+                        }
+                    }
+                    
+                    // Fallback to getText() if page-by-page didn't work
+                    if (empty(trim($text))) {
+                        $text = $pdf->getText();
+                    }
                     
                     if (!empty(trim($text))) {
-                        \Log::info('Enhanced smalot parsing succeeded', ['config' => $configOptions, 'textLength' => strlen($text)]);
+                        \Log::info('Enhanced smalot parsing succeeded', [
+                            'config' => $configOptions,
+                            'pageCount' => count($pages),
+                            'textLength' => strlen($text)
+                        ]);
                         return $text;
                     }
                     
