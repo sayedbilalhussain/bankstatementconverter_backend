@@ -7,6 +7,7 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
 use PhpOffice\PhpSpreadsheet\Style\Border;
 use PhpOffice\PhpSpreadsheet\Style\Fill;
+use PhpOffice\PhpSpreadsheet\Cell\Coordinate;
 use Smalot\PdfParser\Parser;
 use Smalot\PdfParser\Config;
 use setasign\Fpdi\Fpdi;
@@ -300,7 +301,19 @@ class PdfToExcelConverter
                     }
                     // Start new transaction
                     $currentTransaction = $this->parseBankAlfalahTransaction($line);
-                    $consecutiveNonTransactionLines = 0;
+                    
+                    // ENTERPRISE: Validate transaction was parsed correctly
+                    if (empty($currentTransaction['date'])) {
+                        // Date extraction failed, log and skip
+                        \Log::warning('Transaction parsing failed - no date extracted', [
+                            'line' => substr($line, 0, 100),
+                            'lineIndex' => $lineIndex
+                        ]);
+                        $currentTransaction = null;
+                        $consecutiveNonTransactionLines++;
+                    } else {
+                        $consecutiveNonTransactionLines = 0;
+                    }
                 } 
                 // If no date but we have a current transaction, this might be a continuation line
                 elseif ($currentTransaction && !empty($currentTransaction['date'])) {
@@ -358,7 +371,10 @@ class PdfToExcelConverter
             'totalLines' => count($lines),
             'transactionsFound' => count($transactionLines),
             'firstTransactionDate' => !empty($transactionLines) ? ($transactionLines[0]['date'] ?? 'N/A') : 'N/A',
-            'lastTransactionDate' => !empty($transactionLines) ? (end($transactionLines)['date'] ?? 'N/A') : 'N/A'
+            'lastTransactionDate' => !empty($transactionLines) ? (end($transactionLines)['date'] ?? 'N/A') : 'N/A',
+            'transactionsWithAmounts' => count(array_filter($transactionLines, function($t) {
+                return !empty($t['debit']) || !empty($t['credit']) || !empty($t['balance']);
+            }))
         ]);
         
         // Sort transactions by date (if dates are available)
@@ -370,14 +386,31 @@ class PdfToExcelConverter
         });
         
         // Add transactions to data
-        foreach ($transactionLines as $transaction) {
+        foreach ($transactionLines as $index => $transaction) {
+            // ENTERPRISE: Ensure all fields are properly extracted and cleaned
+            $debit = $this->removeCurrencySymbol($transaction['debit'] ?? '');
+            $credit = $this->removeCurrencySymbol($transaction['credit'] ?? '');
+            $balance = $this->removeCurrencySymbol($transaction['balance'] ?? '');
+            
+            // Log if transaction is missing amounts (for debugging first few rows)
+            if (empty($debit) && empty($credit) && empty($balance) && !empty($transaction['date']) && $index < 5) {
+                \Log::warning('Transaction missing all amounts', [
+                    'index' => $index,
+                    'date' => $transaction['date'] ?? '',
+                    'description' => substr($transaction['description'] ?? '', 0, 80),
+                    'raw_debit' => $transaction['debit'] ?? 'EMPTY',
+                    'raw_credit' => $transaction['credit'] ?? 'EMPTY',
+                    'raw_balance' => $transaction['balance'] ?? 'EMPTY'
+                ]);
+            }
+            
             $data[] = [
                 $transaction['date'] ?? '',
                 trim($transaction['description'] ?? ''),
                 $transaction['cheq_inst'] ?? '',
-                $this->removeCurrencySymbol($transaction['debit'] ?? ''),
-                $this->removeCurrencySymbol($transaction['credit'] ?? ''),
-                $this->removeCurrencySymbol($transaction['balance'] ?? '')
+                $debit,
+                $credit,
+                $balance
             ];
         }
         
@@ -468,16 +501,39 @@ class PdfToExcelConverter
             ];
         }
         
-        // Remove date from line for further processing
-        $remaining = preg_replace('/^\d{1,2}-\d{1,2}-\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4}/', '', $line, 1);
-        $remaining = trim($remaining);
+        // ENTERPRISE: Use full line for analysis to ensure amounts are extracted correctly
+        // Amounts might be anywhere in the line, so analyze the complete line
+        $columns = $this->splitIntoStructuredColumns($line);
         
-        // ENTERPRISE APPROACH: Split line into potential columns using multiple spaces or tabs
-        // This respects the table structure better
-        $columns = $this->splitIntoStructuredColumns($remaining);
+        // Analyze column structure using FULL line (not just remaining part)
+        // This ensures amounts at the end are always captured
+        $analysis = $this->analyzeColumnStructure($columns, $line);
         
-        // Analyze column structure
-        $analysis = $this->analyzeColumnStructure($columns, $remaining);
+        // If no amounts found, try fallback extraction on full line
+        if (empty($analysis['debit']) && empty($analysis['credit']) && empty($analysis['balance'])) {
+            // Try extracting amounts directly from full line
+            $amounts = $this->extractAmountsWithPositions($line);
+            if (empty($amounts)) {
+                $amounts = $this->extractAmountsFallback($line);
+            }
+            
+            // If we found amounts, assign them
+            if (!empty($amounts)) {
+                if (count($amounts) >= 2) {
+                    $analysis['balance'] = $amounts[count($amounts) - 1]['value'];
+                    $lineLower = strtolower($line);
+                    if (stripos($lineLower, 'transfer') !== false || 
+                        stripos($lineLower, 'charge') !== false ||
+                        stripos($lineLower, 'payment') !== false) {
+                        $analysis['debit'] = $amounts[0]['value'];
+                    } else {
+                        $analysis['credit'] = $amounts[0]['value'];
+                    }
+                } elseif (count($amounts) == 1) {
+                    $analysis['balance'] = $amounts[0]['value'];
+                }
+            }
+        }
         
         return [
             'date' => $date,
@@ -539,6 +595,11 @@ class PdfToExcelConverter
         // Extract all amounts with their positions
         $amounts = $this->extractAmountsWithPositions($fullLine);
         
+        // ENTERPRISE FALLBACK: If no amounts found, try alternative extraction
+        if (empty($amounts)) {
+            $amounts = $this->extractAmountsFallback($fullLine);
+        }
+        
         // Extract Cheq/Inst# first (before amounts)
         $cheqInst = $this->extractCheqInstCode($fullLine);
         $result['cheq_inst'] = $cheqInst;
@@ -555,17 +616,38 @@ class PdfToExcelConverter
             $result['credit'] = $amounts[1]['value'];
             $result['balance'] = $amounts[2]['value'];
         } elseif (count($amounts) == 2) {
-            // Two amounts: Need to determine which is debit/credit
-            // Check positions and context
+            // Two amounts: First is debit/credit, second is balance
             $firstAmount = $amounts[0]['value'];
             $secondAmount = $amounts[1]['value'];
             $result['balance'] = $secondAmount; // Last is always balance
             
-            // Check if first amount position suggests debit or credit
-            // If line has "debit" keyword or negative, it's debit
+            // ENTERPRISE LOGIC: Determine if first amount is debit or credit
             $lineLower = strtolower($fullLine);
-            if (stripos($lineLower, 'debit') !== false || 
+            
+            // Check for debit indicators
+            $isDebit = false;
+            if (stripos($lineLower, 'debit') !== false ||
+                stripos($lineLower, 'charge') !== false ||
+                stripos($lineLower, 'fee') !== false ||
+                stripos($lineLower, 'payment') !== false ||
+                stripos($lineLower, 'withdrawal') !== false ||
+                stripos($lineLower, 'transfer') !== false ||
                 preg_match('/-\s*' . preg_quote($firstAmount, '/') . '/', $fullLine)) {
+                $isDebit = true;
+            }
+            
+            // Check for credit indicators
+            $isCredit = false;
+            if (stripos($lineLower, 'credit') !== false ||
+                stripos($lineLower, 'deposit') !== false ||
+                stripos($lineLower, 'received') !== false ||
+                stripos($lineLower, 'inward') !== false) {
+                $isCredit = true;
+            }
+            
+            // If both indicators exist, prioritize debit for charges/fees
+            if ($isDebit || (!$isCredit && (stripos($lineLower, 'sms') !== false || 
+                                            stripos($lineLower, 'service') !== false))) {
                 $result['debit'] = $firstAmount;
             } else {
                 $result['credit'] = $firstAmount;
@@ -587,71 +669,151 @@ class PdfToExcelConverter
         }
         
         // Extract description: Remove date, amounts, and cheq/inst# from full line
+        // ENTERPRISE: Use original line but remove date first, then carefully remove amounts
         $description = $fullLine;
         
-        // Remove amounts (from right to left to preserve order)
-        $amountsReversed = array_reverse($amounts);
-        foreach ($amountsReversed as $amountInfo) {
-            $description = $this->removeAmountFromString($description, $amountInfo['value'], $amountInfo['position']);
+        // Remove date from start
+        $description = preg_replace('/^\d{1,2}-\d{1,2}-\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4}/', '', $description, 1);
+        $description = trim($description);
+        
+        // Remove amounts from the END first (they're usually at the end)
+        // This preserves description text in the middle
+        if (!empty($amounts)) {
+            // Sort amounts by position (right to left)
+            $amountsByPosition = $amounts;
+            usort($amountsByPosition, function($a, $b) {
+                return $b['position'] - $a['position']; // Reverse sort
+            });
+            
+            foreach ($amountsByPosition as $amountInfo) {
+                $amountValue = $amountInfo['value'];
+                // Remove from end of description string
+                $description = preg_replace('/\s*' . preg_quote($amountValue, '/') . '\s*$/', '', $description);
+                // Also try removing from anywhere if it's clearly an amount (has commas or decimals)
+                if (strpos($amountValue, ',') !== false || strpos($amountValue, '.') !== false) {
+                    $description = preg_replace('/\s+' . preg_quote($amountValue, '/') . '\s+/', ' ', $description);
+                }
+            }
         }
         
-        // Remove cheq/inst# if found
+        // Remove cheq/inst# if found (but preserve surrounding text)
         if (!empty($cheqInst)) {
             $description = preg_replace('/\b' . preg_quote($cheqInst, '/') . '\b/i', '', $description);
         }
         
-        // Clean up description
+        // Clean up description - normalize whitespace
         $description = preg_replace('/\s{2,}/', ' ', $description);
         $description = trim($description);
         
-        // Remove common prefixes
+        // Remove common prefixes but keep actual description
         $description = preg_replace('/^(debit|credit|balance)\s*/i', '', $description);
         
         $result['description'] = $description;
+        
+        // ENTERPRISE VALIDATION: Log if amounts are missing
+        if (empty($amounts) && !empty($date)) {
+            \Log::warning('Transaction has date but no amounts extracted', [
+                'line' => substr($fullLine, 0, 150),
+                'date' => $date
+            ]);
+        }
         
         return $result;
     }
     
     /**
-     * Extract amounts with their positions in the line
+     * Extract amounts with their positions in the line - ENTERPRISE: Handle all formats
      */
     protected function extractAmountsWithPositions(string $line): array
     {
         $amounts = [];
+        $foundPositions = []; // Track positions to avoid duplicates
         
-        // Pattern 1: Numbers with commas and decimals (e.g., 1,234.56, 789,196.42)
+        // Pattern 1: Numbers with commas and decimals (e.g., 1,234.56, 789,196.42, 403335.32)
         // Also match amounts that might have $ prefix
         if (preg_match_all('/\$?[\d,]+\.\d{2}/', $line, $matches, PREG_OFFSET_CAPTURE)) {
             foreach ($matches[0] as $match) {
-                $value = $this->removeCurrencySymbol($match[0]); // Remove $ immediately
-                $amounts[] = [
-                    'value' => $value,
-                    'position' => $match[1]
-                ];
+                $value = $this->removeCurrencySymbol($match[0]);
+                $pos = $match[1];
+                if (!in_array($pos, $foundPositions)) {
+                    $amounts[] = [
+                        'value' => $value,
+                        'position' => $pos
+                    ];
+                    $foundPositions[] = $pos;
+                }
             }
         }
         
-        // Pattern 2: Numbers with commas but no decimals (e.g., 20,000) - only if substantial
-        if (preg_match_all('/\$?[\d,]+(?<!\.\d{2})(?=\s|$)/', $line, $matches, PREG_OFFSET_CAPTURE)) {
+        // Pattern 2: Numbers without decimals (e.g., 215, 20,000) - IMPORTANT: Include small amounts too
+        // Look for standalone numbers that are likely amounts (not years, dates, etc.)
+        // Match: 3+ digits OR 1-2 digits followed by comma and 3+ digits
+        if (preg_match_all('/\b(\d{3,}|\d{1,2},\d{3,})\b/', $line, $matches, PREG_OFFSET_CAPTURE)) {
             foreach ($matches[0] as $match) {
-                $cleanNum = str_replace(',', '', $match[0]);
-                $cleanNum = $this->removeCurrencySymbol($cleanNum);
-                if (is_numeric($cleanNum) && $cleanNum >= 100) {
-                    // Check if this isn't already captured as decimal amount
-                    $isDuplicate = false;
-                    foreach ($amounts as $existing) {
-                        if (str_replace(',', '', $existing['value']) === $cleanNum) {
-                            $isDuplicate = true;
-                            break;
-                        }
+                $pos = $match[1];
+                $rawValue = $match[0];
+                
+                // Skip if this position is already captured as decimal amount
+                $isDuplicate = false;
+                foreach ($foundPositions as $foundPos) {
+                    if (abs($pos - $foundPos) < 5) { // Within 5 characters, likely same amount
+                        $isDuplicate = true;
+                        break;
                     }
-                    if (!$isDuplicate) {
-                        $value = $this->removeCurrencySymbol($match[0]); // Remove $ immediately
+                }
+                
+                if ($isDuplicate) {
+                    continue;
+                }
+                
+                $cleanNum = str_replace(',', '', $rawValue);
+                $cleanNum = $this->removeCurrencySymbol($cleanNum);
+                
+                // Accept numbers >= 1 (not just >= 100) to catch small charges like 215
+                // But exclude if it looks like a year (4 digits starting with 19 or 20)
+                if (is_numeric($cleanNum) && 
+                    $cleanNum >= 1 && 
+                    !preg_match('/^(19|20)\d{2}$/', $cleanNum)) { // Not a year
+                    
+                    // Check if it's not part of a date pattern
+                    $context = substr($line, max(0, $pos - 10), 25);
+                    $isDatePart = preg_match('/\d{1,2}[-\/]\d{1,2}[-\/]' . preg_quote($cleanNum, '/') . '/', $context) ||
+                                  preg_match('/' . preg_quote($cleanNum, '/') . '[-\/]\d{1,2}[-\/]\d{2,4}/', $context);
+                    
+                    if (!$isDatePart) {
+                        $value = $this->removeCurrencySymbol($rawValue);
                         $amounts[] = [
                             'value' => $value,
-                            'position' => $match[1]
+                            'position' => $pos
                         ];
+                        $foundPositions[] = $pos;
                     }
+                }
+            }
+        }
+        
+        // Pattern 3: Also catch 2-digit numbers that might be small amounts (like 34.4, but handle carefully)
+        // Only if they appear after text and before a larger amount
+        if (preg_match_all('/\b(\d{1,2})\b(?=\s+[\d,]+\.\d{2})/', $line, $matches, PREG_OFFSET_CAPTURE)) {
+            foreach ($matches[0] as $match) {
+                $pos = $match[1];
+                $rawValue = $match[0];
+                
+                // Skip if already captured
+                $isDuplicate = false;
+                foreach ($foundPositions as $foundPos) {
+                    if (abs($pos - $foundPos) < 3) {
+                        $isDuplicate = true;
+                        break;
+                    }
+                }
+                
+                if (!$isDuplicate && is_numeric($rawValue) && $rawValue >= 1) {
+                    $amounts[] = [
+                        'value' => $rawValue,
+                        'position' => $pos
+                    ];
+                    $foundPositions[] = $pos;
                 }
             }
         }
@@ -703,6 +865,45 @@ class PdfToExcelConverter
         // Remove the amount, being careful not to remove parts of other text
         $text = preg_replace('/\s*' . preg_quote($amount, '/') . '\s*/', ' ', $text);
         return trim($text);
+    }
+    
+    /**
+     * Fallback amount extraction - simpler pattern matching
+     */
+    protected function extractAmountsFallback(string $line): array
+    {
+        $amounts = [];
+        
+        // Very simple pattern: find all numbers with commas or decimals
+        // Match: digits with optional commas and optional decimals
+        if (preg_match_all('/([\d,]+(?:\.\d{1,2})?)/', $line, $matches, PREG_OFFSET_CAPTURE)) {
+            foreach ($matches[0] as $match) {
+                $value = $match[0];
+                $pos = $match[1];
+                
+                // Clean and validate
+                $cleanValue = str_replace(',', '', $value);
+                $cleanValue = $this->removeCurrencySymbol($cleanValue);
+                
+                // Must be a valid number and substantial (>= 1)
+                if (is_numeric($cleanValue) && $cleanValue >= 1) {
+                    // Skip if it's likely a year
+                    if (!preg_match('/^(19|20)\d{2}$/', $cleanValue)) {
+                        $amounts[] = [
+                            'value' => $this->removeCurrencySymbol($value),
+                            'position' => $pos
+                        ];
+                    }
+                }
+            }
+        }
+        
+        // Sort by position
+        usort($amounts, function($a, $b) {
+            return $a['position'] - $b['position'];
+        });
+        
+        return $amounts;
     }
     
     /**
@@ -1169,9 +1370,15 @@ class PdfToExcelConverter
      */
     protected function applyFormatting($sheet, int $maxRow): void
     {
-        // Auto-size columns
-        foreach (range('A', 'Z') as $col) {
-            $sheet->getColumnDimension($col)->setAutoSize(true);
+        // Set equal width for all columns (user can adjust if needed)
+        $equalWidth = 20; // Default width in characters
+        $highestColumn = $sheet->getHighestColumn();
+        $highestColumnIndex = Coordinate::columnIndexFromString($highestColumn);
+        
+        // Set equal width for all columns from A to highest column
+        for ($colIndex = 1; $colIndex <= $highestColumnIndex; $colIndex++) {
+            $col = Coordinate::stringFromColumnIndex($colIndex);
+            $sheet->getColumnDimension($col)->setWidth($equalWidth);
         }
         
         // Apply header formatting if we have multiple rows
