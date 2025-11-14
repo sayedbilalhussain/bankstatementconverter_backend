@@ -316,9 +316,26 @@ class PdfToExcelConverter
                 
                 // If this line has a date, it's a new transaction
                 if ($hasDate) {
-                    // Save previous transaction if exists
+                    // ENTERPRISE: Save previous transaction if exists
+                    // But only if it's complete (has amounts) or we've given up on it
                     if ($currentTransaction && !empty($currentTransaction['date'])) {
-                        $transactionLines[] = $currentTransaction;
+                        // If transaction has amounts, it's complete - save it
+                        if (!empty($currentTransaction['debit']) || 
+                            !empty($currentTransaction['credit']) || 
+                            !empty($currentTransaction['balance'])) {
+                            // Clean up description before saving
+                            $currentTransaction['description'] = $this->cleanDescription($currentTransaction['description']);
+                            $transactionLines[] = $currentTransaction;
+                        } else {
+                            // Transaction incomplete but new one starting - log and save anyway
+                            // This handles edge cases where amounts weren't found
+                            \Log::warning('Incomplete transaction saved - no amounts found', [
+                                'date' => $currentTransaction['date'],
+                                'description' => substr($currentTransaction['description'], 0, 100)
+                            ]);
+                            $currentTransaction['description'] = $this->cleanDescription($currentTransaction['description']);
+                            $transactionLines[] = $currentTransaction;
+                        }
                     }
                     // Start new transaction
                     // ENTERPRISE: Check if this line has amounts (single-line transaction)
@@ -336,13 +353,22 @@ class PdfToExcelConverter
                         $currentTransaction = null;
                         $consecutiveNonTransactionLines++;
                     } else {
-                        // If amounts were extracted, this is a complete single-line transaction
+                        // ENTERPRISE: Preserve full description from first line
+                        // Don't truncate - the description cell may continue on next lines
+                        // If this is a single-line transaction with amounts, save it
+                        // Otherwise, keep it open for continuation lines
                         if ($hasAmountsInLine && (!empty($currentTransaction['debit']) || 
                             !empty($currentTransaction['credit']) || 
                             !empty($currentTransaction['balance']))) {
-                            // Complete transaction, save it
+                            // Complete single-line transaction, save it
+                            // Clean up description to remove any amount fragments
+                            $currentTransaction['description'] = $this->cleanDescription($currentTransaction['description']);
                             $transactionLines[] = $currentTransaction;
                             $currentTransaction = null;
+                        } else {
+                            // Multi-line transaction - description will be built from continuation lines
+                            // Preserve the initial description from first line
+                            $currentTransaction['description'] = trim($currentTransaction['description']);
                         }
                         $consecutiveNonTransactionLines = 0;
                     }
@@ -371,14 +397,43 @@ class PdfToExcelConverter
                         $amountsInLine = array_values($amountsInLine); // Re-index
                         
                         if (!empty($amountsInLine)) {
-                            // Extract text before amounts (if any) and add to description
+                            // ENTERPRISE: Extract Cheq/Inst# from this line if present (before amounts)
+                            // Format: "FundTransfer\t244000\t1229120.94" or "PK13ALFH00630010\t114608.00 1473120.94"
+                            $cheqInstFromLine = $this->extractCheqInstFromAmountLine($line, $amountsInLine);
+                            if (!empty($cheqInstFromLine)) {
+                                $currentTransaction['cheq_inst'] = $cheqInstFromLine;
+                            }
+                            
+                            // ENTERPRISE: Extract text before amounts (if any) and add to description
+                            // This preserves the full description cell content
                             $textBeforeAmounts = $this->extractTextBeforeAmounts($line);
                             if (!empty($textBeforeAmounts)) {
-                                $currentTransaction['description'] .= ' ' . $textBeforeAmounts;
+                                // Check if it's a Cheq/Inst# code (not description text)
+                                if (!$this->isAmount($textBeforeAmounts) && 
+                                    !empty($textBeforeAmounts) && 
+                                    preg_match('/[A-Za-z]/', $textBeforeAmounts)) {
+                                    // Could be Cheq/Inst# or description text
+                                    // If it looks like a code, use as Cheq/Inst#
+                                    if (preg_match('/^(FundTransfer|PK\d+|VO\d+|[A-Z]{2,}\d+)/i', $textBeforeAmounts)) {
+                                        if (empty($currentTransaction['cheq_inst'])) {
+                                            $currentTransaction['cheq_inst'] = $textBeforeAmounts;
+                                        }
+                                    } else {
+                                        // It's description text, add to description
+                                        if (!empty($currentTransaction['description'])) {
+                                            $currentTransaction['description'] .= ' ' . $textBeforeAmounts;
+                                        } else {
+                                            $currentTransaction['description'] = $textBeforeAmounts;
+                                        }
+                                    }
+                                }
                             }
                             
                             // Extract amounts and assign them
                             $this->assignAmountsToTransaction($currentTransaction, $amountsInLine, $line);
+                            
+                            // ENTERPRISE: Clean up description - remove any amount fragments that might have leaked
+                            $currentTransaction['description'] = $this->cleanDescription($currentTransaction['description']);
                             
                             // Save completed transaction
                             $transactionLines[] = $currentTransaction;
@@ -386,25 +441,61 @@ class PdfToExcelConverter
                             $consecutiveNonTransactionLines = 0;
                         } else {
                             // No valid amounts found, treat as continuation
+                            // This is part of the description cell
                             $continuationText = $this->cleanContinuationLine($line);
                             if (!empty($continuationText)) {
-                                $currentTransaction['description'] .= ' ' . $continuationText;
+                                if (!empty($currentTransaction['description'])) {
+                                    $currentTransaction['description'] .= ' ' . $continuationText;
+                                } else {
+                                    $currentTransaction['description'] = $continuationText;
+                                }
                             }
                             $consecutiveNonTransactionLines = 0;
                         }
                     }
-                    // Check if this looks like a continuation (has text but no date, no amounts)
-                    elseif ($this->isContinuationLine($line)) {
-                        // Append to description - preserve all text
+                    // ENTERPRISE: Check if this is a continuation line (has text, no date, no amounts)
+                    // Be more aggressive - if it has text and we have an active transaction, it's likely a continuation
+                    elseif (!empty($currentTransaction['date']) && 
+                            !$this->hasDate($line) && 
+                            !$this->hasAmounts($line) &&
+                            preg_match('/[A-Za-z]/', $line)) {
+                        // This is a continuation line - add to description
+                        // Preserve all text as part of the description cell
                         $continuationText = $this->cleanContinuationLine($line);
                         if (!empty($continuationText)) {
-                            $currentTransaction['description'] .= ' ' . $continuationText;
+                            // Combine with existing description
+                            if (!empty($currentTransaction['description'])) {
+                                $currentTransaction['description'] .= ' ' . $continuationText;
+                            } else {
+                                $currentTransaction['description'] = $continuationText;
+                            }
+                        }
+                        $consecutiveNonTransactionLines = 0;
+                    } 
+                    // Check if this looks like a continuation using the formal method
+                    elseif ($this->isContinuationLine($line)) {
+                        // ENTERPRISE: Append to description - preserve all text as a single cell
+                        // Multi-line descriptions should be combined with proper spacing
+                        $continuationText = $this->cleanContinuationLine($line);
+                        if (!empty($continuationText)) {
+                            if (!empty($currentTransaction['description'])) {
+                                $currentTransaction['description'] .= ' ' . $continuationText;
+                            } else {
+                                $currentTransaction['description'] = $continuationText;
+                            }
                         }
                         $consecutiveNonTransactionLines = 0;
                     } else {
-                        // Doesn't look like continuation, save current and reset
-                        $transactionLines[] = $currentTransaction;
-                        $currentTransaction = null;
+                        // Doesn't look like continuation
+                        // Only save if we have amounts, otherwise keep waiting for continuation
+                        if (!empty($currentTransaction['debit']) || 
+                            !empty($currentTransaction['credit']) || 
+                            !empty($currentTransaction['balance'])) {
+                            // Transaction has amounts, save it
+                            $currentTransaction['description'] = $this->cleanDescription($currentTransaction['description']);
+                            $transactionLines[] = $currentTransaction;
+                            $currentTransaction = null;
+                        }
                         $consecutiveNonTransactionLines++;
                     }
                 } 
@@ -518,6 +609,7 @@ class PdfToExcelConverter
     
     /**
      * Check if line is a continuation of previous transaction
+     * ENTERPRISE: More aggressive detection for multi-line descriptions
      */
     protected function isContinuationLine(string $line): bool
     {
@@ -526,6 +618,7 @@ class PdfToExcelConverter
         // - Have text (not just numbers)
         // - Don't start with amounts
         // - May have reference numbers or codes
+        // - May have account numbers or brackets
         
         if ($this->hasDate($line)) {
             return false; // Has date, so it's a new transaction
@@ -547,8 +640,23 @@ class PdfToExcelConverter
             return false;
         }
         
-        // Has text, likely a continuation
-        return preg_match('/[A-Za-z]/', $line);
+        // ENTERPRISE: Has text, likely a continuation
+        // Also check for common continuation patterns:
+        // - Lines starting with parentheses: "(Alfalah to Member)"
+        // - Lines starting with brackets: "<00631008383327"
+        // - Lines with account numbers but also text
+        // - Lines that are clearly part of a description
+        if (preg_match('/[A-Za-z]/', $line)) {
+            // Check for common continuation patterns
+            if (preg_match('/^[\(<]/', $line) || // Starts with ( or <
+                preg_match('/\b(To|from|via|Account|Ref#|TRANS\.ID:)\b/i', $line) || // Common keywords
+                preg_match('/\d{12,}/', $line)) { // Has account numbers
+                return true;
+            }
+            return true; // Has text, likely continuation
+        }
+        
+        return false;
     }
     
     /**
@@ -799,7 +907,13 @@ class PdfToExcelConverter
         // Find the position of the first amount
         $firstAmountPos = false;
         foreach ($amounts as $amt) {
+            // Try to find the amount in the line (handle tab-separated and space-separated)
             $pos = strpos($line, $amt);
+            if ($pos === false) {
+                // Try without commas
+                $amtNoComma = str_replace(',', '', $amt);
+                $pos = strpos($line, $amtNoComma);
+            }
             if ($pos !== false && ($firstAmountPos === false || $pos < $firstAmountPos)) {
                 $firstAmountPos = $pos;
             }
@@ -817,14 +931,59 @@ class PdfToExcelConverter
     }
     
     /**
+     * Extract Cheq/Inst# from a line that contains amounts
+     * Format: "FundTransfer\t244000\t1229120.94" or "PK13ALFH00630010\t114608.00 1473120.94"
+     */
+    protected function extractCheqInstFromAmountLine(string $line, array $amounts): string
+    {
+        // If line has tabs, check first tab-separated column
+        if (strpos($line, "\t") !== false) {
+            $parts = explode("\t", $line);
+            if (count($parts) >= 2) {
+                $firstPart = trim($parts[0]);
+                // Check if first part is a Cheq/Inst# code (not an amount)
+                if (!empty($firstPart) && 
+                    !$this->isAmount($firstPart) && 
+                    preg_match('/[A-Za-z]/', $firstPart)) {
+                    // Validate it's a code pattern
+                    if (preg_match('/^(FundTransfer|PK\d+|VO\d+|[A-Z]{2,}\d*|[A-Z]{3,})/i', $firstPart)) {
+                        return $firstPart;
+                    }
+                }
+            }
+        }
+        
+        // Also check text before amounts
+        $textBefore = $this->extractTextBeforeAmounts($line);
+        if (!empty($textBefore) && 
+            !$this->isAmount($textBefore) && 
+            preg_match('/[A-Za-z]/', $textBefore)) {
+            // Check if it looks like a code
+            if (preg_match('/^(FundTransfer|PK\d+|VO\d+|[A-Z]{2,}\d*|[A-Z]{3,})/i', $textBefore)) {
+                return $textBefore;
+            }
+        }
+        
+        return '';
+    }
+    
+    /**
      * Clean continuation line (remove amounts that might be at the end, but preserve all text)
+     * ENTERPRISE: Preserves multi-line cell structure
      */
     protected function cleanContinuationLine(string $line): string
     {
-        // Don't remove trailing amounts if they're part of the description
-        // Just clean up extra whitespace
+        // ENTERPRISE: Preserve the line structure - don't remove trailing amounts
+        // that might be part of reference numbers or codes
+        // Just normalize whitespace (multiple spaces to single space)
+        // But preserve the actual content
         $line = preg_replace('/\s{2,}/', ' ', $line);
-        return trim($line);
+        
+        // Remove only if it's clearly an amount at the very end (with proper validation)
+        // Don't remove account numbers or reference codes
+        $line = trim($line);
+        
+        return $line;
     }
     
     /**
